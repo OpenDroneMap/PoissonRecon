@@ -34,6 +34,8 @@ DAMAGE.
 #include <stdlib.h>
 #include <float.h>
 #include <algorithm>
+#include <unordered_set>
+#include <list>
 #include "FEMTree.h"
 #include "MyMiscellany.h"
 #include "CmdLineParser.h"
@@ -42,27 +44,26 @@ DAMAGE.
 #include "Ply.h"
 #include "VertexFactory.h"
 
-MessageWriter messageWriter;
+using namespace PoissonRecon;
 
-
-cmdLineParameter< char* >
+CmdLineParameter< char* >
 	In( "in" ) ,
 	Out( "out" );
-cmdLineParameter< int >
-	Smooth( "smooth" , 5 );
-cmdLineParameter< float >
+CmdLineParameter< float >
 	Trim( "trim" ) ,
 	IslandAreaRatio( "aRatio" , 0.001f );
-cmdLineReadable
+CmdLineReadable
 	PolygonMesh( "polygonMesh" ) ,
 	Long( "long" ) ,
 	ASCII( "ascii" ) ,
+	RemoveIslands( "removeIslands" ) ,
+	Debug( "debug" ) ,
 	Verbose( "verbose" );
 
 
-cmdLineReadable* params[] =
+CmdLineReadable* params[] =
 {
-	&In , &Out , &Trim , &PolygonMesh , &Smooth , &IslandAreaRatio , &Verbose , &Long , &ASCII ,
+	&In , &Out , &Trim , &PolygonMesh , &IslandAreaRatio , &Verbose , &Long , &ASCII , &RemoveIslands , &Debug ,
 	NULL
 };
 
@@ -72,28 +73,134 @@ void ShowUsage( char* ex )
 	printf( "\t --%s <input polygon mesh>\n" , In.name );
 	printf( "\t --%s <trimming value>\n" , Trim.name );
 	printf( "\t[--%s <ouput polygon mesh>]\n" , Out.name );
-	printf( "\t[--%s <smoothing iterations>=%d]\n" , Smooth.name , Smooth.value );
 	printf( "\t[--%s <relative area of islands>=%f]\n" , IslandAreaRatio.name , IslandAreaRatio.value );
+	printf( "\t[--%s]\n" , RemoveIslands.name );
+	printf( "\t[--%s]\n" , Debug.name );
 	printf( "\t[--%s]\n" , PolygonMesh.name );
 	printf( "\t[--%s]\n" , Long.name );
 	printf( "\t[--%s]\n" , ASCII.name );
 	printf( "\t[--%s]\n" , Verbose.name );
 }
 
+template< typename Index >
+struct ComponentGraph
+{
+	struct Node
+	{
+		double area;
+		std::vector< Node * > neighbors;
+		std::list< Index > polygonIndices;
+
+		Node( void ) : area(0) {}
+
+		void merge( void )
+		{
+			auto PopBack =[&]( std::vector< Node * > &nodes , size_t idx )
+			{
+				nodes[idx] = nodes.back();
+				nodes.pop_back();
+			};
+
+			if( !neighbors.size() ) MK_THROW( "No neighbors" );
+
+			// Remove the node from the neighbors of the neighbors
+			for( unsigned int i=0 ; i<neighbors.size() ; i++ ) for( int j=(int)neighbors[i]->neighbors.size()-1 ; j>=0 ; j-- ) if( neighbors[i]->neighbors[j]==this )
+				PopBack( neighbors[i]->neighbors , j );
+
+			// Merge the node into its first neighbor
+			Node *first = neighbors[0];
+			first->area += area;
+			first->polygonIndices.splice( first->polygonIndices.end() , polygonIndices );
+
+			// Merge the remaining neighbors into the first neighbor
+			for( unsigned int i=1 ; i<neighbors.size() ; i++ )
+			{
+				first->area += neighbors[i]->area;
+				first->polygonIndices.splice( first->polygonIndices.end() , neighbors[i]->polygonIndices );
+				for( unsigned int j=0 ; j<neighbors[i]->neighbors.size() ; j++ )
+				{
+					bool foundNeighbor = false;
+					for( int k=(int)neighbors[i]->neighbors[j]->neighbors.size()-1 ; k>=0 ; k-- )
+						if( neighbors[i]->neighbors[j]->neighbors[k]==neighbors[i] ) PopBack( neighbors[i]->neighbors[j]->neighbors , k );
+
+					for( unsigned int k=0 ; k<first->neighbors.size() ; k++ ) foundNeighbor |= neighbors[i]->neighbors[j]==first->neighbors[k];
+					if( !foundNeighbor )
+					{
+						first->neighbors.push_back( neighbors[i]->neighbors[j] );
+						neighbors[i]->neighbors[j]->neighbors.push_back( first );
+					}
+				}
+
+				neighbors[i]->area = 0;
+				neighbors[i]->neighbors.clear();
+			}
+			// Clean up the node
+			polygonIndices.clear();
+			area = 0;
+		}
+	};
+
+	static void SanityCheck( size_t count , std::function< const Node * ( size_t ) > nodeFunction )
+	{
+		std::unordered_map< const Node * , int > flags;
+		for( unsigned int i=0 ; i<count ; i++ ) flags[ nodeFunction(i) ] = 0;
+		for( auto iter=flags.begin() ; iter!=flags.end() ; iter++ ) if( !iter->second ) _PropagateFlag( flags , iter->first , 1 );
+
+		for( auto iter=flags.begin() ; iter!=flags.end() ; iter++ ) for( unsigned int j=0 ; j<iter->first->neighbors.size() ; j++ )
+		{
+			if( iter->second==flags[ iter->first->neighbors[j] ] ) MK_THROW( "Not a bipartite graph" );
+			bool foundSelf = false;
+			for( unsigned int k=0 ; k<iter->first->neighbors[j]->neighbors.size() ; k++ ) if( iter->first->neighbors[j]->neighbors[k]==iter->first ) foundSelf = true;
+			if( !foundSelf ) MK_THROW( "Asymmetric graph" );
+		}
+	}
+
+protected:
+	static void _PropagateFlag( std::unordered_map< const Node * , int > &flags , const Node *n , int flag )
+	{
+		if( flags[n] ) return;
+		else
+		{
+			flags[n] = flag;
+			for( unsigned int i=0 ; i<n->neighbors.size() ; i++ ) _PropagateFlag( flags , n->neighbors[i] , -flag );
+		}
+
+	}
+
+};
+
 template< typename Real , unsigned int Dim , typename ... AuxData >
-using ValuedPointData = VectorTypeUnion< Real , Point< Real , Dim > , Real , AuxData ... >;
+using ValuedPointData = DirectSum< Real , Point< Real , Dim > , Real , AuxData ... >;
+
+template< typename Index >
+size_t BoostHash( Index i1 , Index i2 )
+{
+	size_t hash = (size_t)i1 + 0x9e3779b9;
+	hash ^= (size_t)i2 + 0x9e3779b9 + (hash<<6) + (hash>>2);
+	return hash;
+}
 
 template< typename Index >
 struct EdgeKey
 {
 	Index key1 , key2;
-	EdgeKey( Index k1=0 , Index k2=0 ) : key1(k1) , key2(k2) {}
+	EdgeKey( Index k1=0 , Index k2=0 )
+	{
+		if( k1<k2 ) key1 = k1 , key2 = k2;
+		else        key1 = k2 , key2 = k1;
+	}
 	bool operator == ( const EdgeKey &key ) const  { return key1==key.key1 && key2==key.key2; }
-#if 1
-	struct Hasher{ size_t operator()( const EdgeKey &key ) const { return (size_t)( key.key1 * key.key2 ); } };
-#else
-	struct Hasher{ size_t operator()( const EdgeKey &key ) const { return key.key1 ^ key.key2; } };
-#endif
+	struct Hasher{ size_t operator()( const EdgeKey &key ) const { return BoostHash(key.key1,key.key2); } };
+};
+
+template< typename Index >
+struct HalfEdgeKey
+{
+	Index key1 , key2;
+	HalfEdgeKey( Index k1=0 , Index k2=0 ) : key1(k1) , key2(k2) {}
+	HalfEdgeKey opposite( void ) const { return HalfEdgeKey( key2 , key1 ); }
+	bool operator == ( const HalfEdgeKey &key ) const  { return key1==key.key1 && key2==key.key2; }
+	struct Hasher{ size_t operator()( const HalfEdgeKey &key ) const { return BoostHash(key.key1,key.key2); } };
 };
 
 template< typename Real , unsigned int Dim ,  typename ... AuxData >
@@ -102,25 +209,6 @@ ValuedPointData< Real , Dim , AuxData ... > InterpolateVertices( const ValuedPoi
 	if( v1.template get<1>()==v2.template get<1>() ) return (v1+v2)/Real(2.);
 	Real dx = ( v1.template get<1>()-value ) / ( v1.template get<1>()-v2.template get<1>() );
 	return v1 * (Real)(1.-dx) + v2*dx;
-}
-
-template< typename Real , unsigned int Dim , typename Index , typename ... AuxData >
-void SmoothValues( std::vector< ValuedPointData< Real , Dim , AuxData ... > >& vertices , const std::vector< std::vector< Index > >& polygons )
-{
-	std::vector< int > count( vertices.size() );
-	std::vector< Real > sums( vertices.size() , 0 );
-	for( size_t i=0 ; i<polygons.size() ; i++ )
-	{
-		int sz = int(polygons[i].size());
-		for( int j=0 ; j<sz ; j++ )
-		{
-			int j1 = j , j2 = (j+1)%sz;
-			Index v1 = polygons[i][j1] , v2 = polygons[i][j2];
-			count[v1]++ , count[v2]++;
-			sums[v1] += vertices[v2].template get<1>() , sums[v2] += vertices[v1].template get<1>();
-		}
-	}
-	for( size_t i=0 ; i<vertices.size() ; i++ ) vertices[i].template get<1>() = ( sums[i] + vertices[i].template get<1>() ) / ( count[i] + 1 );
 }
 
 template< typename Real , unsigned int Dim , typename Index , typename ... AuxData >
@@ -222,7 +310,9 @@ double PolygonArea( const std::vector< Vertex >& vertices , const std::vector< I
 		Point< Real , Dim > v[] = { v2-v1 , v3-v1 };
 		XForm< Real , 2 > Mass;
 		for( int i=0 ; i<2 ; i++ ) for( int j=0 ; j<2 ; j++ ) Mass(i,j) = Point< Real , Dim >::Dot( v[i] , v[j] );
-		return (Real)( sqrt( Mass.determinant() ) / 2. );
+		double det = Mass.determinant();
+		if( det<0 ) return (Real)0;
+		else return (Real)( sqrt( Mass.determinant() ) / 2. );
 	};
 
 	if( polygon.size()<3 ) return 0.;
@@ -319,7 +409,6 @@ int Execute( AuxDataFactories ... auxDataFactories )
 	std::vector< std::string > comments;
 	PLY::ReadPolygons< Factory , Index >( In.value , factory , vertices , polygons , ft , comments );
 
-	for( int i=0 ; i<Smooth.value ; i++ ) SmoothValues< Real , Dim , Index >( vertices , polygons );
 	min = max = vertices[0].template get<1>();
 	for( size_t i=0 ; i<vertices.size() ; i++ ) min = std::min< Real >( min , vertices[i].template get<1>() ) , max = std::max< Real >( max , vertices[i].template get<1>() );
 
@@ -327,62 +416,133 @@ int Execute( AuxDataFactories ... auxDataFactories )
 	std::vector< std::vector< Index > > ltPolygons , gtPolygons;
 	std::vector< bool > ltFlags , gtFlags;
 
-	messageWriter( comments , "*********************************************\n" );
-	messageWriter( comments , "*********************************************\n" );
-	messageWriter( comments , "** Running Surface Trimmer (Version %s) **\n" , VERSION );
-	messageWriter( comments , "*********************************************\n" );
-	messageWriter( comments , "*********************************************\n" );
+	if( Verbose.set )
+	{
+		std::cout << "*********************************************" << std::endl;
+		std::cout << "*********************************************" << std::endl;
+		std::cout << "** Running Surface Trimmer (Version " << ADAPTIVE_SOLVERS_VERSION << ") **" << std::endl;
+		std::cout << "*********************************************" << std::endl;
+		std::cout << "*********************************************" << std::endl;
+	}
 	char str[1024];
 	for( int i=0 ; params[i] ; i++ )
 		if( params[i]->set )
 		{
 			params[i]->writeValue( str );
-			if( strlen( str ) ) messageWriter( comments , "\t--%s %s\n" , params[i]->name , str );
-			else                messageWriter( comments , "\t--%s\n" , params[i]->name );
+			if( Verbose.set )
+			{
+				if( strlen( str ) ) std::cout << "\t--" << params[i]->name << " " << str << std::endl;
+				else                std::cout << "\t--" << params[i]->name << std::endl;
+			}
 		}
 	if( Verbose.set ) printf( "Value Range: [%f,%f]\n" , min , max );
 
 	double t=Time();
 	for( size_t i=0 ; i<polygons.size() ; i++ ) SplitPolygon( polygons[i] , vertices , &ltPolygons , &gtPolygons , &ltFlags , &gtFlags , vertexTable , Trim.value );
+
 	if( IslandAreaRatio.value>0 )
 	{
-		std::vector< std::vector< Index > > _ltPolygons , _gtPolygons;
-		std::vector< std::vector< Index > > ltComponents , gtComponents;
-		SetConnectedComponents( ltPolygons , ltComponents );
-		SetConnectedComponents( gtPolygons , gtComponents );
-		std::vector< double > ltAreas( ltComponents.size() , 0. ) , gtAreas( gtComponents.size() , 0. );
-		std::vector< bool > ltComponentFlags( ltComponents.size() , false ) , gtComponentFlags( gtComponents.size() , false );
-		double area = 0.;
-		for( size_t i=0 ; i<ltComponents.size() ; i++ )
+		std::vector< std::vector< Index > > _polygons , _components;
+		size_t gtComponentStart;
 		{
-			for( size_t j=0 ; j<ltComponents[i].size() ; j++ )
+			std::vector< std::vector< Index > > ltComponents , gtComponents;
+			SetConnectedComponents( ltPolygons , ltComponents );
+			SetConnectedComponents( gtPolygons , gtComponents );
+			gtComponentStart = ltComponents.size();
+			for( unsigned int i=0 ; i<gtComponents.size() ; i++ ) for( unsigned int j=0 ; j<gtComponents[i].size() ; j++ ) gtComponents[i][j] += (Index)ltPolygons.size();
+
+			_polygons.reserve( ltPolygons.size() + gtPolygons.size() );
+			_components.reserve( ltComponents.size() + gtComponents.size() );
+			_polygons.insert( _polygons.end() , ltPolygons.begin() , ltPolygons.end() );
+			_polygons.insert( _polygons.end() , gtPolygons.begin() , gtPolygons.end() );
+			_components.insert( _components.end() , ltComponents.begin() , ltComponents.end() );
+			_components.insert( _components.end() , gtComponents.begin() , gtComponents.end() );
+		}
+		std::vector< typename ComponentGraph< Index >::Node > nodes( _components.size() );
+
+		// Set the polygons within each component and compute areas
+		for( unsigned int i=0 ; i<_components.size() ; i++ )
+		{
+			nodes[i].polygonIndices.insert( nodes[i].polygonIndices.end() , _components[i].begin() , _components[i].end() );
+			for( auto iter=nodes[i].polygonIndices.begin() ; iter!=nodes[i].polygonIndices.end() ; iter++ ) nodes[i].area += PolygonArea< Real , Dim , Index , Vertex >( vertices , _polygons[ *iter ] );
+		}
+
+		// Compute the connectivity
+
+		// A map identifying half-edges along the boundaries of components and associating them with the component
+		std::unordered_map< HalfEdgeKey< Index > , Index , typename HalfEdgeKey< Index >::Hasher > componentBoundaryHalfEdges;
+		for( unsigned int i=0 ; i<_components.size() ; i++ )
+		{
+			// All the half-edges for a given component
+			std::unordered_set< HalfEdgeKey< Index > , typename HalfEdgeKey< Index >::Hasher > componentHalfEdges;
+			for( unsigned int j=0 ; j<_components[i].size() ; j++ )
 			{
-				ltAreas[i] += PolygonArea< Real , Dim , Index , Vertex >( vertices , ltPolygons[ ltComponents[i][j] ] );
-				ltComponentFlags[i] = ( ltComponentFlags[i] || ltFlags[ ltComponents[i][j] ] );
+				const std::vector< Index > &poly = _polygons[ _components[i][j] ];
+				for( unsigned int k=0 ; k<poly.size() ; k++ )
+				{
+					Index v1 = poly[k] , v2 = poly[ (k+1)%poly.size() ];
+					HalfEdgeKey< Index > eKey = HalfEdgeKey< Index >(v1,v2);
+					componentHalfEdges.insert( eKey );
+				}
 			}
-			area += ltAreas[i];
-		}
-		for( size_t i=0 ; i<gtComponents.size() ; i++ )
-		{
-			for( size_t j=0 ; j<gtComponents[i].size() ; j++ )
+			for( auto iter=componentHalfEdges.begin() ; iter!=componentHalfEdges.end() ; iter++ )
 			{
-				gtAreas[i] += PolygonArea< Real , Dim , Index , Vertex >( vertices , gtPolygons[ gtComponents[i][j] ] );
-				gtComponentFlags[i] = ( gtComponentFlags[i] || gtFlags[ gtComponents[i][j] ] );
+				HalfEdgeKey< Index > key = *iter;
+				HalfEdgeKey< Index > _key = key.opposite();
+				if( componentHalfEdges.find( _key )==componentHalfEdges.end() ) componentBoundaryHalfEdges[ key ] = (Index)i;
 			}
-			area += gtAreas[i];
 		}
-		for( size_t i=0 ; i<ltComponents.size() ; i++ )
+
+		// A set identify the dual edges of the component graph
+		std::unordered_set< EdgeKey< Index > , typename EdgeKey< Index >::Hasher > componentEdges;
+		for( auto iter=componentBoundaryHalfEdges.begin() ; iter!=componentBoundaryHalfEdges.end() ; iter++ )
 		{
-			if( ltAreas[i]<area*IslandAreaRatio.value && ltComponentFlags[i] ) for( size_t j=0 ; j<ltComponents[i].size() ; j++ ) _gtPolygons.push_back( ltPolygons[ ltComponents[i][j] ] );
-			else                                                               for( size_t j=0 ; j<ltComponents[i].size() ; j++ ) _ltPolygons.push_back( ltPolygons[ ltComponents[i][j] ] );
+			HalfEdgeKey< Index > key = iter->first;
+			HalfEdgeKey< Index > _key = key.opposite();
+			auto _iter = componentBoundaryHalfEdges.find( _key );
+			if( _iter!=componentBoundaryHalfEdges.end() ) componentEdges.insert( EdgeKey< Index >( iter->second , _iter->second ) );
 		}
-		for( size_t i=0 ; i<gtComponents.size() ; i++ )
+		for( auto iter=componentEdges.begin() ; iter!=componentEdges.end() ; iter++ )
 		{
-			if( gtAreas[i]<area*IslandAreaRatio.value && gtComponentFlags[i] ) for( size_t j=0 ; j<gtComponents[i].size() ; j++ ) _ltPolygons.push_back( gtPolygons[ gtComponents[i][j] ] );
-			else                                                               for( size_t j=0 ; j<gtComponents[i].size() ; j++ ) _gtPolygons.push_back( gtPolygons[ gtComponents[i][j] ] );
+			nodes[ iter->key1 ].neighbors.push_back( &nodes[ iter->key2 ] );
+			nodes[ iter->key2 ].neighbors.push_back( &nodes[ iter->key1 ] );
 		}
-		ltPolygons = _ltPolygons , gtPolygons = _gtPolygons;
+		if( Debug.set ) ComponentGraph< Index >::SanityCheck( nodes.size() , [&]( size_t i ){ return &nodes[i]; } );
+
+		auto ComponentCount = [&]( void )
+		{
+			unsigned int count = 0;
+			for( unsigned int i=0 ; i<nodes.size() ; i++ ) if( nodes[i].polygonIndices.size() ) count++;
+			return count;
+		};
+
+		double area = 0;
+		for( unsigned int i=0 ; i<nodes.size() ; i++ ) area += nodes[i].area;
+
+		bool done = false;
+		while( !done )
+		{
+			done = true;
+			unsigned int idx = -1;
+			for( unsigned int i=0 ; i<nodes.size() ; i++ ) if( nodes[i].polygonIndices.size() && nodes[i].neighbors.size() ) if( idx==-1 || nodes[i].area<nodes[idx].area ) idx = i;
+			if( idx!=-1 && nodes[idx].area<area*IslandAreaRatio.value )
+			{
+				nodes[idx].merge();
+				done = false;
+				if( Debug.set ) ComponentGraph< Index >::SanityCheck( nodes.size() , [&]( size_t i ){ return &nodes[i]; } );
+			}
+		}
+
+		ltPolygons.clear() , gtPolygons.clear();
+
+		for( unsigned int i=0 ; i<gtComponentStart ; i++ )
+			if( !nodes[i].neighbors.size() && nodes[i].area<area*IslandAreaRatio.value && RemoveIslands.set ) ; // small island
+			else for( auto iter=nodes[i].polygonIndices.begin() ; iter!=nodes[i].polygonIndices.end() ; iter++ ) ltPolygons.push_back( _polygons[ *iter ] );
+		for( unsigned int i=(unsigned int)gtComponentStart ; i<nodes.size() ; i++ )
+			if( !nodes[i].neighbors.size() && nodes[i].area<area*IslandAreaRatio.value && RemoveIslands.set ) ; // small island
+			else for( auto iter=nodes[i].polygonIndices.begin() ; iter!=nodes[i].polygonIndices.end() ; iter++ ) gtPolygons.push_back( _polygons[ *iter ] );
 	}
+
 	if( !PolygonMesh.set )
 	{
 		{
@@ -398,15 +558,13 @@ int Execute( AuxDataFactories ... auxDataFactories )
 	RemoveHangingVertices( vertices , gtPolygons );
 	char comment[1024];
 	sprintf( comment , "#Trimmed In: %9.1f (s)" , Time()-t );
-	comments.push_back( comment );
 	if( Out.set ) PLY::WritePolygons( Out.value , factory , vertices , gtPolygons , ASCII.set ? PLY_ASCII : ft , comments );
 
 	return EXIT_SUCCESS;
 }
 int main( int argc , char* argv[] )
 {
-	cmdLineParse( argc-1 , &argv[1] , params );
-	messageWriter.echoSTDOUT = Verbose.set;
+	CmdLineParse( argc-1 , &argv[1] , params );
 
 	if( !In.set || !Trim.set )
 	{
@@ -419,9 +577,15 @@ int main( int argc , char* argv[] )
 	Factory factory;
 	bool *readFlags = new bool[ factory.plyReadNum() ];
 	std::vector< PlyProperty > unprocessedProperties;
-	PLY::ReadVertexHeader( In.value , factory , readFlags , unprocessedProperties );
-	if( !factory.plyValidReadProperties<0>( readFlags ) ) ERROR_OUT( "Ply file does not contain positions" );
-	if( !factory.plyValidReadProperties<1>( readFlags ) ) ERROR_OUT( "Ply file does not contain values" );
+	size_t vNum;
+	PLY::ReadVertexHeader( In.value , factory , readFlags , unprocessedProperties , vNum );
+	if( vNum>std::numeric_limits< int >::max() )
+	{
+		if( !Long.set ) MK_WARN( "Number of vertices not supported by 32-bit indexing. Switching to 64-bit indexing" );
+		Long.set = true;
+	}
+	if( !factory.template plyValidReadProperties<0>( readFlags ) ) MK_THROW( "Ply file does not contain positions" );
+	if( !factory.template plyValidReadProperties<1>( readFlags ) ) MK_THROW( "Ply file does not contain values" );
 	delete[] readFlags;
 
 	if( Long.set ) return Execute< Real , Dim , long long >( VertexFactory::DynamicFactory< Real >( unprocessedProperties ) );
