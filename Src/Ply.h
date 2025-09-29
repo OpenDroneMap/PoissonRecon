@@ -51,54 +51,74 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vector>
 #include <string>
 #include <functional>
+#include <math.h>
 #include "PlyFile.h"
 #include "Geometry.h"
-#include "CoredMesh.h"
+#include "DataStream.h"
 #include "MyMiscellany.h"
+#include "Array.h"
 
-namespace PLY
+namespace PoissonRecon
 {
-	// Converts from C-type to PLY type
-	template< class Scalar > int Type( void );
-
-	// Converts from C-type to PLY name
-	template< typename Integer > struct Traits{ static const std::string name; };
-
-	// A structure representing a face
-	template< typename Index >
-	struct Face
+	namespace PLY
 	{
-		unsigned int nr_vertices;
-		Index *vertices;
+		// Converts from C-type to PLY type
+		template< class Scalar > int Type( void );
 
-		static PlyProperty Properties[];
-	};
+		// Converts from C-type to PLY name
+		template< typename Integer > struct Traits{ static const std::string name; };
 
-	int DefaultFileType( void );
+		// A structure representing a face
+		template< typename Index >
+		struct Edge
+		{
+			Index v1 , v2;
+			static const PlyProperty Properties[];
+		};
 
-	// PLY read header functionality
+		// A structure representing a face
+		template< typename Index , bool UseCharIndex=false >
+		struct Face
+		{
+			unsigned int nr_vertices;
+			Index *vertices;
 
-	// Get the properties (and return the file type)
-	int ReadVertexHeader( std::string fileName , std::vector< PlyProperty > &properties );
+			static const PlyProperty Properties[];
+		};
 
-	// Test which properties are represented by elements of the vertex factory (and return the file type)
-	template< typename VertexFactory >
-	int ReadVertexHeader( std::string fileName , const VertexFactory &vFactory , bool *readFlags );
+		inline int DefaultFileType( void );
 
-	// Test which properties are represented by elements of the vertex factory and add the others to the property list (and return the file type)
-	template< typename VertexFactory >
-	int ReadVertexHeader( std::string fileName , const VertexFactory &vFactory , bool *readFlags , std::vector< PlyProperty > &unprocessedProperties );
+		// PLY read header functionality
 
-	// PLY write mesh functionality
-	template< typename VertexFactory , typename Index , class Real , int Dim , typename OutputIndex=int >
-	void WritePolygons( std::string fileName , const VertexFactory &vFactory , CoredMeshData< typename VertexFactory::VertexType , Index > *mesh , int file_type , const std::vector< std::string >& comments , std::function< typename VertexFactory::VertexType ( typename VertexFactory::VertexType ) > xForm = []( typename VertexFactory::VertexType v ){ return v; } );
+		// Get the properties (and return the file type)
+		inline int ReadVertexHeader( std::string fileName , std::vector< PlyProperty > &properties );
 
-	template< typename VertexFactory , typename Index >
-	void WritePolygons( std::string fileName , const VertexFactory &vFactory , const std::vector< typename VertexFactory::VertexType > &vertices , const std::vector< std::vector< Index > > &polygons , int file_type , const std::vector< std::string > &comments );
+		// Test which properties are represented by elements of the vertex factory (and return the file type)
+		template< typename VertexFactory >
+		int ReadVertexHeader( std::string fileName , const VertexFactory &vFactory , bool *readFlags );
 
-	// PLY read mesh functionality
-	template< typename VertexFactory , typename Index >
-	void ReadPolygons( std::string fileName , const VertexFactory &vFactory , std::vector< typename VertexFactory::VertexType > &vertices , std::vector< std::vector< Index > >& polygons , int &file_type , std::vector< std::string > &comments , bool* readFlags=NULL );
-}
+		// Test which properties are represented by elements of the vertex factory and add the others to the property list (and return the file type)
+		template< typename VertexFactory >
+		int ReadVertexHeader( std::string fileName , const VertexFactory &vFactory , bool *readFlags , std::vector< PlyProperty > &unprocessedProperties );
+
+		// PLY write mesh functionality
+		template< typename VertexFactory , typename Index , class Real , int Dim , typename OutputIndex=int , bool UseCharIndex=false >
+		void Write( std::string fileName , const VertexFactory &vFactory , size_t vertexNum , size_t polygonNum , InputDataStream< typename VertexFactory::VertexType > &vertexStream , InputDataStream< std::vector< Index > > &polygonStream , int file_type , const std::vector< std::string >& comments );
+
+		template< typename VertexFactory , typename Index , class Real , int Dim , typename OutputIndex=int >
+		void Write( std::string fileName , const VertexFactory &vFactory , size_t vertexNum , size_t edgeNum , InputDataStream< typename VertexFactory::VertexType > &vertexStream , InputDataStream< std::pair< Index , Index > > &edgeStream , int file_type , const std::vector< std::string >& comments );
+
+		template< typename VertexFactory , typename Index , bool UseCharIndex=false >
+		void WritePolygons( std::string fileName , const VertexFactory &vFactory , const std::vector< typename VertexFactory::VertexType > &vertices , const std::vector< std::vector< Index > > &polygons , int file_type , const std::vector< std::string > &comments );
+
+		// PLY read mesh functionality
+		template< typename VertexFactory , typename Index >
+		void ReadPolygons( std::string fileName , const VertexFactory &vFactory , std::vector< typename VertexFactory::VertexType > &vertices , std::vector< std::vector< Index > >& polygons , int &file_type , std::vector< std::string > &comments , bool* readFlags=NULL );
+
+		template< typename VertexFactory , typename Index >
+		void ReadEdges( std::string fileName , const VertexFactory &vFactory , std::vector< typename VertexFactory::VertexType > &vertices , std::vector< std::pair< Index , Index > >& edges , int &file_type , std::vector< std::string > &comments , bool* readFlags=NULL );
+	}
 #include "Ply.inl"
+}
+
 #endif // PLY_INCLUDED

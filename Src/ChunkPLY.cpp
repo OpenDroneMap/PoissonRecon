@@ -41,16 +41,20 @@ DAMAGE.
 #include "CmdLineParser.h"
 #include "Geometry.h"
 #include "Ply.h"
-#include "VertexStream.h"
+#include "DataStream.h"
 #include "VertexFactory.h"
+#include "DataStream.imp.h"
 
-cmdLineParameters< char* > In( "in" );
-cmdLineParameter< char* > Out( "out" );
-cmdLineParameter< float > Width( "width" , -1.f ) , PadRadius( "radius" , 0.f );
-cmdLineParameterArray< float , 6 > BoundingBox( "bBox" );
-cmdLineReadable ASCII( "ascii" ) , Verbose( "verbose" ) , NoNormals( "noNormals" ) , Colors( "colors" ) , Values( "values" );
+using namespace PoissonRecon;
 
-cmdLineReadable* params[] = { &In , &Out , &Width , &PadRadius , &ASCII , &Verbose , &BoundingBox , &NoNormals , &Colors , &Values , NULL };
+CmdLineParameters< char* > In( "in" );
+CmdLineParameter< char* > Out( "out" );
+CmdLineParameter< float > Width( "width" , -1.f ) , PadRadius( "radius" , 0.f );
+CmdLineParameterArray< float , 6 > BoundingBox( "bBox" );
+CmdLineParameters< Point< float , 4 > > HalfSpaces( "halfSpaces" );
+CmdLineReadable ASCII( "ascii" ) , Verbose( "verbose" ) , NoNormals( "noNormals" ) , Colors( "colors" ) , Values( "values" );
+
+CmdLineReadable* params[] = { &In , &Out , &Width , &PadRadius , &ASCII , &Verbose , &BoundingBox , &NoNormals , &Colors , &Values , &HalfSpaces , NULL };
 
 void ShowUsage( char* ex )
 {
@@ -60,6 +64,7 @@ void ShowUsage( char* ex )
 	printf( "\t[--%s <chunk width>=%f]\n" , Width.name , Width.value );
 	printf( "\t[--%s <padding radius (as a fraction of the width)>=%f]\n" , PadRadius.name , PadRadius.value );
 	printf( "\t[--%s <minx miny minz maxx maxy maxz>]\n" , BoundingBox.name );
+	printf( "\t[--%s <half-space num, {x1,y1,z1,o1}, ..., {xn,yn,zn,on}>]\n" , HalfSpaces.name );
 	printf( "\t[--%s]\n" , NoNormals.name );
 	printf( "\t[--%s]\n" , Colors.name );
 	printf( "\t[--%s]\n" , Values.name );
@@ -73,6 +78,8 @@ void PrintBoundingBox( Point< float , 3 > min , Point< float , 3 > max )
 	for( unsigned int d=0 ; d<3 ; d++ ) printf( " %f" , min[d] );
 	printf( " ] [" );
 	for( unsigned int d=0 ; d<3 ; d++ ) printf( " %f" , max[d] );
+	printf( " ] ->" );
+	for( unsigned int d=0 ; d<3 ; d++ ) printf( " %.2e" , max[d]-min[d] );
 	printf( " ]" );
 }
 
@@ -102,15 +109,15 @@ void Read( char *const *fileNames , unsigned int fileNum , VertexDataFactory ver
 			if( !strcasecmp( ext , "bnpts" ) ) pointStream = new BinaryInputDataStream< FullVertexFactory< Real , Dim , VertexDataFactory > >( fileNames[i] , vertexFactory );
 			else                               pointStream = new  ASCIIInputDataStream< FullVertexFactory< Real , Dim , VertexDataFactory > >( fileNames[i] , vertexFactory );
 			size_t count = 0;
-			VertexType< Real , Dim , VertexDataFactory > v;
-			while( pointStream->next( v ) ) count++;
+			VertexType< Real , Dim , VertexDataFactory > v = vertexFactory();
+			while( pointStream->read( v ) ) count++;
 			pointStream->reset();
-			_vertices.resize( count );
+			_vertices.resize( count , v );
 			comments.resize( 0 );
 			ft = PLY_BINARY_NATIVE;
 
 			count = 0;
-			while( pointStream->next( _vertices[count++] ) );
+			while( pointStream->read( _vertices[count++] ) );
 			delete pointStream;
 		}
 		delete[] ext;
@@ -142,7 +149,7 @@ void WritePoints( const char *fileName , int ft , VertexDataFactory vertexDataFa
 	if     ( !strcasecmp( ext , "ply"   ) ) pointStream = new    PLYOutputDataStream< FullVertexFactory< Real , Dim , VertexDataFactory > >( fileName , vertexFactory , vertices.size() , ft );
 	else if( !strcasecmp( ext , "bnpts" ) ) pointStream = new BinaryOutputDataStream< FullVertexFactory< Real , Dim , VertexDataFactory > >( fileName , vertexFactory );
 	else                                    pointStream = new  ASCIIOutputDataStream< FullVertexFactory< Real , Dim , VertexDataFactory > >( fileName , vertexFactory );
-	for( size_t i=0 ; i<vertices.size() ; i++ ) pointStream->next( vertices[i] );
+	for( size_t i=0 ; i<vertices.size() ; i++ ) pointStream->write( vertices[i] );
 	delete pointStream;
 
 	delete[] ext;
@@ -157,13 +164,13 @@ void WriteMesh( const char *fileName , int ft , VertexDataFactory vertexDataFact
 	FullVertexFactory< Real , Dim , VertexDataFactory > vertexFactory( VertexFactory::PositionFactory< Real , Dim >() , vertexDataFactory );
 
 	char *ext = GetFileExtension( fileName );
-	if( strcasecmp( ext , "ply" ) ) ERROR_OUT( "Can only output mesh to .ply file" );
+	if( strcasecmp( ext , "ply" ) ) MK_THROW( "Can only output mesh to .ply file" );
 	delete[] ext;
 
 	if( vertices.size()>std::numeric_limits< int >::max() )
 	{
-		if( vertices.size()>std::numeric_limits< unsigned int >::max() ) ERROR_OUT( "more vertices than can be indexed by an unsigned int: %llu" , (unsigned long long)vertices.size() );
-		WARN( "more vertices than can be indexed by an int, using unsigned int instead: %llu" , (unsigned long long)vertices.size() );
+		if( vertices.size()>std::numeric_limits< unsigned int >::max() ) MK_THROW( "more vertices than can be indexed by an unsigned int: %llu" , (unsigned long long)vertices.size() );
+		MK_WARN( "more vertices than can be indexed by an int, using unsigned int instead: %llu" , (unsigned long long)vertices.size() );
 		std::vector< std::vector< unsigned int > > outPolygons;
 		outPolygons.resize( polygons.size() );
 		for( size_t i=0 ; i<polygons.size() ; i++ )
@@ -275,17 +282,28 @@ void Execute( VertexDataFactory vertexDataFactory )
 	float width = Width.value;
 
 
-	if( BoundingBox.set )
+	if( BoundingBox.set || HalfSpaces.set )
 	{
-		Point< float , 3 > min( BoundingBox.values[0] , BoundingBox.values[1] , BoundingBox.values[2] );
-		Point< float , 3 > max( BoundingBox.values[3] , BoundingBox.values[4] , BoundingBox.values[5] );
-		auto InBoundingBox = [&]( Point< float , 3 > p )
+		Point< float , 3 > min , max;
+
+		if( BoundingBox.set )
 		{
-			return
-				p[0]>=min[0] && p[0]<max[0] &&
-				p[1]>=min[1] && p[1]<max[1] &&
-				p[2]>=min[2] && p[2]<max[2];
-		};
+			min = Point< float , 3 >( BoundingBox.values[0] , BoundingBox.values[1] , BoundingBox.values[2] );
+			max = Point< float , 3 >( BoundingBox.values[3] , BoundingBox.values[4] , BoundingBox.values[5] );
+		}
+
+		auto Inside = [&]( Point< float , 3 > p )
+			{
+				bool inside = true;
+				if( BoundingBox.set ) inside &= p[0]>=min[0] && p[0]<max[0] && p[1]>=min[1] && p[1]<max[1] && p[2]>=min[2] && p[2]<max[2];
+				if( inside && HalfSpaces.set )
+				{
+					Point< float , 4 > _p( p[0] , p[1] , p[2] , 1.f );
+					for( unsigned int i=0 ; i<(unsigned int)HalfSpaces.count ; i++ ) inside &= Point< float , 4 >::Dot( _p , HalfSpaces.values[i] )<=0;
+				}
+				return inside;
+			};
+
 		if( polygons.size() )
 		{
 			std::vector< std::vector< long long > > _polygons;
@@ -299,7 +317,7 @@ void Execute( VertexDataFactory vertexDataFactory )
 					Point< float , 3 > center;
 					for( int j=0 ; j<polygons[i].size() ; j++ ) center += vertices[ polygons[i][j] ].template get<0>();
 					center /= polygons[i].size();
-					if( InBoundingBox( center ) ) polygonCount++;
+					if( Inside( center ) ) polygonCount++;
 				}
 				_polygons.reserve( polygonCount );
 			}
@@ -309,7 +327,7 @@ void Execute( VertexDataFactory vertexDataFactory )
 				Point< float , 3 > center;
 				for( int j=0 ; j<polygons[i].size() ; j++ ) center += vertices[ polygons[i][j] ].template get<0>();
 				center /= polygons[i].size();
-				if( InBoundingBox( center ) ) _polygons.push_back( polygons[i] );
+				if( Inside( center ) ) _polygons.push_back( polygons[i] );
 			}
 			printf( "\tChunked polygons:\n" );
 			printf( "\t\tTime (Wall/CPU): %.2f / %.2f\n" , timer.wallTime() , timer.cpuTime() );
@@ -329,7 +347,7 @@ void Execute( VertexDataFactory vertexDataFactory )
 
 					WriteMesh( Out.value , ASCII.set ? PLY_ASCII : ft , vertexDataFactory , _vertices , _polygons , comments );
 				}
-				else WARN( "no polygons in bounding box" );
+				else MK_WARN( "no polygons in bounding box" );
 		}
 		else
 		{
@@ -339,12 +357,12 @@ void Execute( VertexDataFactory vertexDataFactory )
 #ifdef NEW_CHUNKS
 			{
 				size_t vertexCount = 0;
-				for( size_t i=0 ; i<vertices.size() ; i++ ) if( InBoundingBox( vertices[i].template get<0>() ) ) vertexCount++;
+				for( size_t i=0 ; i<vertices.size() ; i++ ) if( Inside( vertices[i].template get<0>() ) ) vertexCount++;
 				_vertices.reserve( vertexCount );
 			}
 #endif // NEW_CHUNKS
 
-			for( size_t i=0 ; i<vertices.size() ; i++ ) if( InBoundingBox( vertices[i].template get<0>() ) ) _vertices.push_back( vertices[i] );
+			for( size_t i=0 ; i<vertices.size() ; i++ ) if( Inside( vertices[i].template get<0>() ) ) _vertices.push_back( vertices[i] );
 			printf( "\tChunked vertices:\n" );
 			printf( "\t\tTime (Wall/CPU): %.2f / %.2f\n" , timer.wallTime() , timer.cpuTime() );
 			printf( "\t\tPeak Memory (MB): %d\n" , MemoryInfo::PeakMemoryUsageMB() );
@@ -360,13 +378,14 @@ void Execute( VertexDataFactory vertexDataFactory )
 
 					WritePoints( Out.value , ASCII.set ? PLY_ASCII : ft , vertexDataFactory , _vertices , comments );
 				}
-				else WARN( "no vertices in bounding box" );
+				else MK_WARN( "no vertices in bounding box" );
 		}
 	}
 	else if( width>0 )
 	{
 		float radius = PadRadius.value * width;
 		size_t vCount=0 , pCount=0;
+		for( unsigned int d=0 ; d<3 ; d++ ) min[d] -= radius , max[d] += radius;
 		for( unsigned int d=0 ; d<3 ; d++ ) min[d] -= width/10000.f , max[d] += width/10000.f;
 		int begin[] = { (int)floor( min[0]/width ) , (int)floor( min[1]/width ) , (int)floor( min[2]/width ) };
 		int end  [] = { (int)ceil ( max[0]/width ) , (int)ceil ( max[1]/width ) , (int)ceil ( max[2]/width ) };
@@ -526,11 +545,11 @@ void Execute( VertexDataFactory vertexDataFactory )
 		{
 			if( polygons.size() )
 			{
-				if( pCount!=polygons.size() ) WARN( "polygon counts don't match: " , polygons.size() , " != " , pCount );
+				if( pCount!=polygons.size() ) MK_WARN( "polygon counts don't match: " , polygons.size() , " != " , pCount );
 			}
 			else
 			{
-				if( vCount!=vertices.size() ) WARN( "vertex counts don't match:" , vertices.size() , " != " , vCount );
+				if( vCount!=vertices.size() ) MK_WARN( "vertex counts don't match:" , vertices.size() , " != " , vCount );
 			}
 		}
 	}
@@ -548,14 +567,9 @@ int main( int argc , char* argv[] )
 	typedef float Real;
 	static constexpr unsigned int Dim = 3;
 
-	cmdLineParse( argc-1 , &argv[1] , params );
-#ifdef USE_SEG_FAULT_HANDLER
-	WARN( "using seg-fault handler" );
-	StackTracer::exec = argv[0];
-	signal( SIGSEGV , SignalHandler );
-#endif // USE_SEG_FAULT_HANDLER
+	CmdLineParse( argc-1 , &argv[1] , params );
 #ifdef ARRAY_DEBUG
-	WARN( "Array debugging enabled" );
+	MK_WARN( "Array debugging enabled" );
 #endif // ARRAY_DEBUG
 
 	if( !In.set )
@@ -571,7 +585,7 @@ int main( int argc , char* argv[] )
 		char *ext = GetFileExtension( In.values[i] );
 		bool _isPly = strcasecmp( ext , "ply" )==0;
 		if( !i ) isPly = _isPly;
-		else if( isPly!=_isPly ) ERROR_OUT( "All files must be of the same type" );
+		else if( isPly!=_isPly ) MK_THROW( "All files must be of the same type" );
 		delete[] ext;
 	}
 	if( isPly )
@@ -583,10 +597,10 @@ int main( int argc , char* argv[] )
 		{
 			std::vector< PlyProperty > unprocessedProperties;
 			PLY::ReadVertexHeader( In.values[i] , factory , readFlags , unprocessedProperties );
-			if( !factory.plyValidReadProperties( readFlags ) ) ERROR_OUT( "Ply file does not contain positions" );
+			if( !factory.plyValidReadProperties( readFlags ) ) MK_THROW( "Ply file does not contain positions" );
 			VertexFactory::DynamicFactory< Real > _remainingProperties( unprocessedProperties );
 			if( !i ) remainingProperties = new VertexFactory::DynamicFactory< Real >( _remainingProperties );
-			else if( (*remainingProperties)!=(_remainingProperties) ) ERROR_OUT( "Remaining properties differ" );
+			else if( (*remainingProperties)!=(_remainingProperties) ) MK_THROW( "Remaining properties differ" );
 		}
 		delete[] readFlags;
 		if( !remainingProperties || !remainingProperties->size() ) Execute( VertexFactory::EmptyFactory< Real >() );

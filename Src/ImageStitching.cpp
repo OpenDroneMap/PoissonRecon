@@ -26,6 +26,7 @@ ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF S
 DAMAGE.
 */
 
+#define BIG_DATA
 #include "PreProcessor.h"
 
 #undef USE_DOUBLE
@@ -48,39 +49,36 @@ DAMAGE.
 #include "Geometry.h"
 #include "FEMTree.h"
 
-cmdLineParameterArray< char* , 2 >
+using namespace PoissonRecon;
+
+CmdLineParameterArray< char* , 2 >
 	In( "in" );
-cmdLineParameter< char* >
+CmdLineParameter< char* >
 	Out( "out" );
-cmdLineParameter< int >
+CmdLineParameter< int >
 #ifdef FAST_COMPILE
 #else // !FAST_COMPILE
 	Degree( "degree" , DEFAULT_FEM_DEGREE ) ,
 #endif // FAST_COMPILE
-#ifdef _OPENMP
-	ParallelType( "parallel" , (int)ThreadPool::OPEN_MP ) ,
-#else // !_OPENMP
-	ParallelType( "parallel" , (int)ThreadPool::THREAD_POOL ) ,
-#endif // _OPENMP
-	ScheduleType( "schedule" , (int)ThreadPool::DefaultSchedule ) ,
-	ThreadChunkSize( "chunkSize" , (int)ThreadPool::DefaultChunkSize ) ,
-	Threads( "threads" , (int)std::thread::hardware_concurrency() ) ,
+	ParallelType( "parallel" , 0 ) ,
+	ScheduleType( "schedule" , (int)ThreadPool::Schedule ) ,
+	ThreadChunkSize( "chunkSize" , (int)ThreadPool::ChunkSize ) ,
 	MaxMemoryGB( "maxMemory" , 0 ) ,
 	GSIterations( "iters" , 8 ) ,
 	FullDepth( "fullDepth" , 6 ) ,
 	BaseDepth( "baseDepth" ) ,
 	BaseVCycles( "baseVCycles" , 4 );
-cmdLineReadable
+CmdLineReadable
 	Verbose( "verbose" ) ,
 	ShowResidual( "showResidual" ) ,
 	Performance( "performance" );
-cmdLineParameter< float >
+CmdLineParameter< float >
 	WeightScale   ( "wScl", 0.125f ) ,
 	WeightExponent( "wExp" , 6.f );
 
-cmdLineReadable* params[] =
+CmdLineReadable* params[] =
 {
-	&In , &Out , &Threads , &Verbose , &ShowResidual , &GSIterations , &FullDepth ,
+	&In , &Out , &Verbose , &ShowResidual , &GSIterations , &FullDepth ,
 	&BaseDepth , &BaseVCycles ,
 	&WeightScale , &WeightExponent ,
 	&Performance ,
@@ -104,7 +102,6 @@ void ShowUsage( char* ex )
 #endif // !FAST_COMPILE
 	printf( "\t[--%s <GS iterations>=%d]\n" , GSIterations.name , GSIterations.value );
 	printf( "\t[--%s <full depth>=%d]\n" , FullDepth.name , FullDepth.value );
-	printf( "\t[--%s <num threads>=%d]\n" , Threads.name , Threads.value );
 	printf( "\t[--%s <parallel type>=%d]\n" , ParallelType.name , ParallelType.value );
 	for( size_t i=0 ; i<ThreadPool::ParallelNames.size() ; i++ ) printf( "\t\t%d] %s\n" , (int)i , ThreadPool::ParallelNames[i].c_str() );
 	printf( "\t[--%s <schedue type>=%d]\n" , ScheduleType.name , ScheduleType.value );
@@ -160,17 +157,6 @@ void WriteImage( char* fileName , RGBPixel* pixels , int w , int h )
 	ImageWriter::Write( fileName , (const unsigned char*)pixels , _w , _h , _c );
 }
 
-struct Profiler
-{
-	double t;
-	Profiler( void ){ t = Time(); }
-	void print( bool newLine=false ) const
-	{
-		printf( "%.2f (s) ; %d (MB)" , Time()-t , MemoryInfo::PeakMemoryUsageMB() );
-		if( newLine ) printf( "\n" );
-	}
-};
-
 template< unsigned int Colors >
 void ReadAndWrite( ImageReader* pixels , ImageReader* labels , ImageWriter* output )
 {
@@ -200,8 +186,8 @@ struct BufferedImageDerivativeStream : public FEMTreeInitializer< DEFAULT_DIMENS
 			_labelRows[i] = new RGBPixel[ _resolution[0] ];
 			_maskRows [i] = new      int[ _resolution[0] ];
 		}
-		if( pixels->channels()!=3 && pixels->channels()!=1 ) ERROR_OUT( "Pixel input must have 1 or 3 channels: " , pixels->channels() );
-		if( labels->channels()!=3 && labels->channels()!=1 ) ERROR_OUT( "Label input must have 1 or 3 channels: " , labels->channels() );
+		if( pixels->channels()!=3 && pixels->channels()!=1 ) MK_THROW( "Pixel input must have 1 or 3 channels: " , pixels->channels() );
+		if( labels->channels()!=3 && labels->channels()!=1 ) MK_THROW( "Label input must have 1 or 3 channels: " , labels->channels() );
 		__pixelRow = pixels->channels()==3 ? NULL : new unsigned char[ _resolution[0] ];
 		__labelRow = labels->channels()==3 ? NULL : new unsigned char[ _resolution[0] ];
 		_r = -2 ; prefetch();
@@ -236,7 +222,7 @@ struct BufferedImageDerivativeStream : public FEMTreeInitializer< DEFAULT_DIMENS
 				_labels->nextRow( __labelRow );
 				for( int i=0 ; i<(int)_resolution[0] ; i++ ) labelRow[i][0] = labelRow[i][1] = labelRow[i][2] = __labelRow[i];
 			}
-			ThreadPool::Parallel_for( 0 , _resolution[0] , [&]( unsigned int , size_t i ){ maskRow[i] = labelRow[i].mask(); } );
+			ThreadPool::ParallelFor( 0 , _resolution[0] , [&]( unsigned int , size_t i ){ maskRow[i] = labelRow[i].mask(); } );
 		}
 	}
 
@@ -288,14 +274,14 @@ protected:
 template< typename Real , unsigned int Degree >
 void _Execute( void )
 {
-	ThreadPool::Init( (ThreadPool::ParallelType)ParallelType.value , Threads.value );
+	ThreadPool::ParallelizationType= (ThreadPool::ParallelType)ParallelType.value;
 	int w , h;
 	{
 		unsigned int _w , _h , _c;
 		ImageReader::GetInfo( In.values[0] , _w , _h , _c );
 		w = _w , h = _h;
 		ImageReader::GetInfo( In.values[1] , _w , _h , _c );
-		if( w!=_w || h!=_h ) ERROR_OUT( "Pixel and label dimensions don't match: " , _w , " x " , _h , " != " , w , " x " , h );
+		if( w!=_w || h!=_h ) MK_THROW( "Pixel and label dimensions don't match: " , _w , " x " , _h , " != " , w , " x " , h );
 	}
 	if( Verbose.set ) printf( "Resolution: %d x %d\n" , w , h );
 
@@ -309,7 +295,6 @@ void _Execute( void )
 	int maxDepth;
 	DenseNodeData< Point< Real , Colors > , IsotropicUIntPack< Dim , FEMSig > > constraints;
 	DenseNodeData< Point< Real , Colors > , IsotropicUIntPack< Dim , FEMSig > > solution;
-
 	{
 		Profiler p;
 		ImageReader* pixels = ImageReader::Get( In.values[0] );
@@ -318,14 +303,14 @@ void _Execute( void )
 		BufferedImageDerivativeStream< Real , Colors > dStream( resolution , pixels , labels );
 		for( int j=0 ; j<h ; j++ )
 		{
+			Point< Real , Colors > zeroData;
 			ThreadPool::ParallelSections
-				(
-					[&]( void ){ dStream.prefetch(); } ,
-					[&]( void ){ maxDepth = FEMTreeInitializer< Dim , Real >::template Initialize< (Degree&1)==0 , Point< Real , Colors > >( tree.spaceRoot() , dStream , derivatives , tree.nodeAllocators.size() ? tree.nodeAllocators[0] : NULL , tree.initializer() ); }
-				);
+			(
+				[&]( void ){ dStream.prefetch(); } ,
+				[&]( void ){ maxDepth = FEMTreeInitializer< Dim , Real >::template Initialize< (Degree&1)==0 , Point< Real , Colors > >( tree.spaceRoot() , dStream , zeroData , derivatives , tree.nodeAllocators.size() ? tree.nodeAllocators[0] : NULL , tree.initializer() ); }
+			);
 			dStream.advance();
 		}
-
 		delete pixels;
 		delete labels;
 		{
@@ -335,11 +320,15 @@ void _Execute( void )
 			for( int i=0 ; i<derivatives[1].size() ; i++ ) nodes.push_back( derivatives[1][i].node );
 			tree.template processNeighbors< 1 , 0 , true >( &nodes[0] , (int)nodes.size() , std::make_tuple() );
 		}
-		tree.template finalizeForMultigrid< Degree , Degree >( BaseDepth.value , FullDepth.value , []( const FEMTreeNode * ){ return true; } , []( const FEMTreeNode * ){ return false; } , std::make_tuple() );
+
+		auto addNodeFunctor = [&]( int d , const int off[Dim] ){ return d<=FullDepth.value; };
+		tree.template finalizeForMultigrid< Degree , Degree >( BaseDepth.value , addNodeFunctor , []( const FEMTreeNode * ){ return true; } , std::make_tuple() );
+
 		if( Verbose.set )
 		{
 			printf( "Valid FEM Nodes / Edges: %llu %llu\n" , (unsigned long long)tree.validFEMNodes( IsotropicUIntPack< Dim , FEMSig >() ) , (unsigned long long)( derivatives[0].size() + derivatives[1].size() ) );
-			printf( "Set tree [%d]: " , maxDepth ) , p.print( true );
+			std::string str = p();
+			printf( "Set tree [%d]: %s\n" , maxDepth , str.c_str() );
 		}
 	}
 
@@ -375,7 +364,11 @@ void _Execute( void )
 			F.weights[0][ TensorDerivatives< FEMDerivative >::Index( derivatives1 ) ][ TensorDerivatives< CDerivative >::Index( derivatives2 ) ] = 1;
 			tree.addFEMConstraints( F , partialY , constraints , maxDepth );
 		}
-		if( Verbose.set ) printf( "Set constraints: " ) , p.print( true );
+		if( Verbose.set )
+		{
+			std::string str = p();
+			printf( "Set constraints: %s\n" , str.c_str() );
+		}
 	}
 	// Solve the system
 	{
@@ -386,14 +379,17 @@ void _Execute( void )
 		sInfo.cgDepth = 0 , sInfo.cascadic = false , sInfo.vCycles = 1 , sInfo.cgAccuracy = 0 , sInfo.verbose = Verbose.set , sInfo.showResidual = ShowResidual.set , sInfo.showGlobalResidual = false , sInfo.sliceBlockSize = ROW_BLOCK_SIZE;
 		sInfo.baseVCycles = BaseVCycles.value;
 		sInfo.iters = GSIterations.value;
-
 		sInfo.useSupportWeights = true;
 		sInfo.sorRestrictionFunction = [&] ( Real w , Real ){ return (Real)( WeightScale.value * pow( w , WeightExponent.value ) ); };
 		sInfo.wCycle = false;
 		typename FEMIntegrator::template System< IsotropicUIntPack< Dim , FEMSig > , IsotropicUIntPack< Dim , 1 > > F( { 0. , 1. } );
 		DenseNodeData< Point< Real , Colors > , IsotropicUIntPack< Dim , FEMSig > > _constraints = tree.template initDenseNodeData< Point< Real , Colors > >( IsotropicUIntPack< Dim , FEMSig >() );
-		tree.solveSystem( IsotropicUIntPack< Dim , FEMSig >() , F , constraints , solution , Point< Real , Colors >::Dot , maxDepth , sInfo );
-		if( Verbose.set ) printf( "Solved system: " ) , p.print( true );
+		tree.solveSystem( IsotropicUIntPack< Dim , FEMSig >() , F , constraints , solution , Point< Real , Colors >::Dot , BaseDepth.value , maxDepth , sInfo );
+		if( Verbose.set )
+		{
+			std::string str = p();
+			printf( "Solved system: %s\n" , str.c_str() );
+		}
 	}
 
 	Point< Real , Colors > average;
@@ -401,7 +397,11 @@ void _Execute( void )
 		Profiler p;
 		Real begin[] = { 0 , 0 } , end[] = { (Real)w/(1<<maxDepth) , (Real)h/(1<<maxDepth) };
 		average = tree.average( solution , begin , end );
-		if( Verbose.set ) printf( "Got average: " ) , p.print( true );
+		if( Verbose.set )
+		{
+			std::string str = p();
+			printf( "Got average: %s\n" , str.c_str() );
+		}
 	}
 	// Stitch the image
 	if( Out.set )
@@ -427,7 +427,7 @@ void _Execute( void )
 				{
 					in->nextRow( inRow );
 					RGBPixel *_inRow = inRows[block&1] + rr*w;
-					ThreadPool::Parallel_for( 0 , w , [&]( unsigned int , size_t i ){ _inRow[i][0] = _inRow[i][1] = _inRow[i][2] = inRow[i]; } );
+					ThreadPool::ParallelFor( 0 , w , [&]( unsigned int , size_t i ){ _inRow[i][0] = _inRow[i][1] = _inRow[i][2] = inRow[i]; } );
 				}
 			}
 		};
@@ -456,7 +456,7 @@ void _Execute( void )
 					begin[0] = 0 , begin[1] = rStart , end[0] = w , end[1] = rEnd;
 					Pointer( Point< Real , Colors > ) outBlock = tree.template regularGridUpSample< true >( solution , begin , end );
 					int size = (rEnd-rStart)*w;
-					ThreadPool::Parallel_for( 0 , size , [&]( unsigned int , size_t ii )
+					ThreadPool::ParallelFor( 0 , size , [&]( unsigned int , size_t ii )
 					{
 						Point< Real , Colors > c = Point< Real , Colors >( _inRows[ii][0] , _inRows[ii][1] , _inRows[ii][2] ) / 255;
 						c += outBlock[ii] - average;
@@ -469,7 +469,11 @@ void _Execute( void )
 		}
 		// Write out the last block
 		SetOutput( blockNum-1 );
-		if( Verbose.set ) printf( "Wrote output: " ) , p.print( true );
+		if( Verbose.set )
+		{
+			std::string str = p();
+			printf( "Wrote output: %s\n" , str.c_str() );
+		}
 		delete[] inRows[0];
 		delete[] outRows[0];
 		delete[] inRows[1];
@@ -491,34 +495,28 @@ void _Execute( void )
 	case 2: _Execute< Real , 2 >() ; break;
 //	case 3: _Execute< Real , 3 >() ; break;
 //	case 4: _Execute< Real , 4 >() ; break;
-	default: ERROR_OUT( "Only B-Splines of degree 1 - 2 are supported" );
+	default: MK_THROW( "Only B-Splines of degree 1 - 2 are supported" );
 	}
 }
 #endif // FAST_COMPILE
 
-int main( int argc , char* argv[] )
+int main( int argc , char* argv[] )	
 {
 	Timer timer;
-#ifdef USE_SEG_FAULT_HANDLER
-	WARN( "using seg-fault handler" );
-	StackTracer::exec = argv[0];
-	signal( SIGSEGV , SignalHandler );
-#endif // USE_SEG_FAULT_HANDLER
 #ifdef ARRAY_DEBUG
-	WARN( "Array debugging enabled" );
+	MK_WARN( "Array debugging enabled" );
 #endif // ARRAY_DEBUG
-	cmdLineParse( argc-1 , &argv[1] , params );
+	CmdLineParse( argc-1 , &argv[1] , params );
 	if( MaxMemoryGB.value>0 ) SetPeakMemoryMB( MaxMemoryGB.value<<10 );
-	ThreadPool::DefaultChunkSize = ThreadChunkSize.value;
-	ThreadPool::DefaultSchedule = (ThreadPool::ScheduleType)ScheduleType.value;
+	ThreadPool::ChunkSize = ThreadChunkSize.value;
+	ThreadPool::Schedule = (ThreadPool::ScheduleType)ScheduleType.value;
 	if( Verbose.set )
 	{
 		printf( "*********************************************\n" );
 		printf( "*********************************************\n" );
-		printf( "** Running Image Stitching (Version %s) **\n" , VERSION );
+		printf( "** Running Image Stitching (Version %s) **\n" , ADAPTIVE_SOLVERS_VERSION );
 		printf( "*********************************************\n" );
 		printf( "*********************************************\n" );
-		if( !Threads.set ) printf( "Running with %d threads\n" , Threads.value );
 	}
 
 	if( !In.set )
@@ -529,7 +527,7 @@ int main( int argc , char* argv[] )
 	if( !BaseDepth.set ) BaseDepth.value = FullDepth.value;
 	if( BaseDepth.value>FullDepth.value )
 	{
-		if( BaseDepth.set ) WARN( "Base depth must be smaller than full depth: " , BaseDepth.value , " <= " , FullDepth.value );
+		if( BaseDepth.set ) MK_WARN( "Base depth must be smaller than full depth: " , BaseDepth.value , " <= " , FullDepth.value );
 		BaseDepth.value = FullDepth.value;
 	}
 
@@ -541,7 +539,7 @@ int main( int argc , char* argv[] )
 
 #ifdef FAST_COMPILE
 	static const int Degree = DEFAULT_FEM_DEGREE;
-	WARN( "Compiled for degree-" , Degree , ", " , sizeof(Real)==4 ? "single" : "double" , "-precision _only_" );
+	MK_WARN( "Compiled for degree-" , Degree , ", " , sizeof(Real)==4 ? "single" : "double" , "-precision _only_" );
 	_Execute< Real , Degree >();
 #else // !FAST_COMPILE
 	_Execute< Real >();
